@@ -1,0 +1,6 @@
+secret.py
+vector_store.json
+__pycache__/
+.env
+docs/
+scans/
