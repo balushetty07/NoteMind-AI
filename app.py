@@ -1,284 +1,539 @@
-"""
-NOTEMIND AI — STARTER KIT (v1)
-====================================
-Your first RAG (Retrieval-Augmented Generation) app — an AI that answers
-questions from YOUR notes, with sources. Free to run: it uses Google's
-free Gemini API, so the heavy thinking happens on Google's servers,
-not your laptop. Works even on old/slow machines!
+"""NoteMind AI - a lightweight notes RAG assistant.
 
-WHAT THIS DOES
---------------
-1. You drop your college notes (.txt or .md files) into a folder called `docs`
-2. Run this file once — it reads the notes, chops them into small chunks,
-   and turns each chunk into a list of numbers (an "embedding" = meaning
-   turned into numbers)
-3. You ask questions in the terminal — it finds the most relevant chunks
-   and asks Google's Gemini AI (running on Google's servers, NOT your
-   laptop) to answer based on YOUR notes, with sources. Open-book exam
-   for the AI. 😎  This works even on old/slow laptops!
+Normal mode (uses Gemini over the internet):
+    python app.py
 
-SETUP (do this once)
---------------------
-1. Install Python 3.10+ from python.org (tick "Add Python to PATH")
-2. Get your FREE Gemini API key (takes 2 minutes):
-   - Go to https://aistudio.google.com and sign in with your Google account
-   - Click "Get API key" -> "Create API key", then copy it
-3. PRIVACY! Keep the key OUT of app.py (never hardcode it):
-   - Windows terminal:  setx GEMINI_API_KEY "your-key-here"
-     (then close and REOPEN VS Code so it takes effect)
-   - Mac/Linux:         export GEMINI_API_KEY="your-key-here"
-   - This code reads the key from that environment variable
-4. In this project folder, install the 2 libraries we need:
-       pip install requests numpy
-5. Create a folder named `docs` next to this file and drop your notes in it
-6. Run:
-       python app.py
+Local mode (searches files on this computer; no API key or internet needed):
+    python app.py --local
 
-PRIVACY NOTES (read these, seriously)
-------------------------------------
-- Your API key lives ONLY in the environment variable, never inside this
-  file. If it ever leaks, delete it in AI Studio and create a fresh one.
-- vector_store.json contains your actual notes -> keep it out of GitHub.
-- The text of your notes IS sent to Google's servers to get AI answers
-  (that's how it runs on any laptop). On the free tier, Google's terms
-  allow them to use your requests to improve their products — fine for
-  study notes, but NEVER feed it passwords, IDs, or personal documents.
-- Before pushing to GitHub, create a .gitignore file in this folder with
-  exactly these lines:
-       .env
-       vector_store.json
-       docs/
-       __pycache__/
+Supported note files: .txt and .md inside the docs/ directory beside this file.
 """
 
+import argparse
 import json
 import os
-from pathlib import Path
 import time
+from pathlib import Path
+
 import numpy as np
 import requests
 
-# ------------------------- SETTINGS (tweak me!) -------------------------
-# PRIVACY: the API key is read from an environment variable, so it never
-# sits inside this file (and this file is what goes to GitHub).
-#   Windows:    setx GEMINI_API_KEY "your-key-here"   (then restart VS Code)
-#   Mac/Linux:  export GEMINI_API_KEY="your-key-here"
-from secret import API_KEY
+BASE_DIR = Path(__file__).resolve().parent
+DOCS_DIR = BASE_DIR / "docs"
+STORE_FILE = BASE_DIR / "vector_store.json"
+
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
-LLM_MODEL = "gemini-flash-latest"           # fast, free tier, runs on Google's servers
-EMBED_MODEL = "gemini-embedding-001"     # turns text into numbers
-DOCS_DIR = Path("docs")                 # folder with your notes
-STORE_FILE = Path("vector_store.json")  # local "database" (just a file!)
-CHUNK_SIZE = 800                        # characters per chunk of a note
-TOP_K = 5                               # how many chunks to hand the LLM
+LLM_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]
+EMBED_MODEL = "gemini-embedding-001"
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
+TOP_K = 5
+REQUEST_TIMEOUT = 60
 
-# ------------------- TALKING TO GEMINI (two functions) -------------------
+
+def get_api_key():
+    """Read the key from the environment, with a backward-compatible secret.py fallback."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if key:
+        return key
+
+    # Existing local copies may already use secret.py. Never commit that file.
+    try:
+        from secret import API_KEY  # type: ignore
+
+        return str(API_KEY).strip()
+    except (ImportError, AttributeError):
+        return ""
 
 
-def check_api_key():
-    """Friendly crash if the GEMINI_API_KEY environment variable isn't set."""
+API_KEY = get_api_key()
+
+
+def api_headers():
     if not API_KEY:
-        raise SystemExit(
-            "\n⚠️  GEMINI_API_KEY is not set! Open a terminal and run:\n\n"
-            "     Windows:    setx GEMINI_API_KEY \"your-key-here\"\n"
-            "     Mac/Linux:  export GEMINI_API_KEY=\"your-key-here\"\n\n"
-            "Then close and REOPEN VS Code, and run me again.\n"
-            "(Get your free key at https://aistudio.google.com)\n"
+        raise RuntimeError(
+            "Gemini API key is missing. Set GEMINI_API_KEY or add a local secret.py."
         )
+    return {"x-goog-api-key": API_KEY, "Content-Type": "application/json"}
 
 
-def gemini_embed(texts):
-    """Send a list of texts to Gemini, get back a list of embeddings."""
-    response = requests.post(
-        f"{GEMINI_URL}/models/{EMBED_MODEL}:batchEmbedContents",
-        params={"key": API_KEY},
-        json={
-            "requests": [
-                {
-                    "model": f"models/{EMBED_MODEL}",
-                    "content": {"parts": [{"text": t}]},
-                }
-                for t in texts
-            ]
-        },
+# ---------------------------------------------------------------------------
+# Local-only note browser and keyword search
+# ---------------------------------------------------------------------------
+
+
+def get_note_files():
+    """Return .txt and .md files directly inside docs/, in stable name order."""
+    if not DOCS_DIR.exists():
+        return []
+    return sorted(
+        (path for path in DOCS_DIR.iterdir()
+         if path.is_file() and path.suffix.lower() in {".txt", ".md"}),
+        key=lambda path: path.name.casefold(),
     )
-    response.raise_for_status()  # crash loudly if the key or internet fails
-    return [np.array(e["values"], dtype=float) for e in response.json()["embeddings"]]
 
 
-MODELS = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"]
+def find_local_matches(query, limit=10):
+    """Search note lines locally without calling Gemini or reading vector_store.json."""
+    query = query.strip()
+    if not query:
+        return []
 
-def gemini_generate(prompt):
-    """Try each model in turn; switch if one is busy or missing."""
-    for round_no in range(2):
-        for model in MODELS:
-            response = requests.post(
-                f"{GEMINI_URL}/models/{model}:generateContent",
-                params={"key": API_KEY},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-            )
-            if response.status_code in (404, 429, 503):
-                print(f"  {model} unavailable ({response.status_code}), trying next...")
+    query_lower = query.casefold()
+    matches = []
+    for path in get_note_files():
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            print(f"Could not read {path.name}: {exc}")
+            continue
+
+        for line_number, line in enumerate(lines, start=1):
+            if query_lower in line.casefold():
+                clean_line = " ".join(line.split())
+                if len(clean_line) > 220:
+                    position = clean_line.casefold().find(query_lower)
+                    start = max(0, position - 70)
+                    end = min(len(clean_line), position + len(query) + 110)
+                    clean_line = ("…" if start else "") + clean_line[start:end]
+                    if end < len(" ".join(line.split())):
+                        clean_line += "…"
+                matches.append(
+                    {"source": path.name, "line": line_number, "text": clean_line}
+                )
+                if len(matches) >= limit:
+                    return matches
+    return matches
+
+
+def print_local_help():
+    print(
+        "\nLocal commands (no API key or internet needed):\n"
+        "  notes              List available .txt and .md files\n"
+        "  stats              Show local note/file/word counts\n"
+        "  find <text>        Search note text (case-insensitive)\n"
+        "  help               Show these commands\n"
+        "  exit               Quit local mode\n"
+        "\nExample: find Fourier transform\n"
+    )
+
+
+def run_local_mode():
+    """Interactive local mode. It only reads files from docs/ and makes no API calls."""
+    print("=" * 58)
+    print("  NOTEMIND AI — LOCAL NOTES TOOLS")
+    print("  Offline keyword search; note text stays on this computer.")
+    print("=" * 58)
+
+    if not DOCS_DIR.exists():
+        DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Created {DOCS_DIR}. Add .txt or .md notes and start local mode again.")
+
+    print_local_help()
+    while True:
+        try:
+            command = input("Local > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting local mode.")
+            break
+
+        if not command:
+            continue
+
+        action, _, argument = command.partition(" ")
+        action = action.casefold()
+        argument = argument.strip()
+
+        if action in {"exit", "quit"}:
+            print("Exiting local mode.")
+            break
+        if action in {"help", ":help", "/help"}:
+            print_local_help()
+        elif action in {"notes", ":notes", "/notes"}:
+            files = get_note_files()
+            if not files:
+                print(f"No .txt or .md notes found in {DOCS_DIR}.")
                 continue
-            response.raise_for_status()
-            return response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        time.sleep(10)
-    raise requests.exceptions.HTTPError("All models busy, try again in a minute")
+            print(f"\nFound {len(files)} note file(s):")
+            for path in files:
+                print(f"  • {path.name} ({path.stat().st_size:,} bytes)")
+            print()
+        elif action in {"stats", ":stats", "/stats"}:
+            files = get_note_files()
+            total_lines = 0
+            total_words = 0
+            total_bytes = 0
+            for path in files:
+                try:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    print(f"Could not read {path.name}: {exc}")
+                    continue
+                total_lines += len(content.splitlines())
+                total_words += len(content.split())
+                total_bytes += path.stat().st_size
+            print("\nLocal note statistics")
+            print(f"  Files: {len(files)}")
+            print(f"  Lines: {total_lines:,}")
+            print(f"  Words: {total_words:,}")
+            print(f"  Size:  {total_bytes:,} bytes\n")
+        elif action in {"find", ":find", "/find"}:
+            if not argument:
+                print("Usage: find <word or phrase>")
+                continue
+            matches = find_local_matches(argument)
+            if not matches:
+                print(f"No matches for {argument!r}.\n")
+                continue
+            print(f"\nFound {len(matches)} matching line(s) (showing at most 10):")
+            for item in matches:
+                print(f"  {item['source']}:{item['line']} — {item['text']}")
+            print()
+        else:
+            print("Unknown command. Type 'help' to see the available commands.")
 
 
-# ----------------------- STEP 1: CHUNKING THE NOTES -----------------------
+# ---------------------------------------------------------------------------
+# Gemini RAG mode
+# ---------------------------------------------------------------------------
 
 
 def chunk_text(text):
-    """Split a long note into bite-sized chunks the AI can search.
-
-    Simple strategy: split on blank lines (paragraphs), then pack
-    paragraphs together until we reach CHUNK_SIZE characters.
-    """
+    """Split note text into chunks, preferring blank-line paragraph boundaries."""
     chunks = []
     current = ""
+
     for paragraph in text.split("\n\n"):
-        # A single huge paragraph? Slice it hard by size.
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+
         while len(paragraph) > CHUNK_SIZE:
-            if current:
+            if current.strip():
                 chunks.append(current.strip())
                 current = ""
             chunks.append(paragraph[:CHUNK_SIZE].strip())
             paragraph = paragraph[CHUNK_SIZE:]
-        if len(current) + len(paragraph) <= CHUNK_SIZE:
+
+        if not current:
+            current = paragraph
+        elif len(current) + len(paragraph) + 2 <= CHUNK_SIZE:
             current += "\n\n" + paragraph
         else:
-            if current.strip():
-                chunks.append(current.strip())
+            chunks.append(current.strip())
             current = paragraph
+
     if current.strip():
         chunks.append(current.strip())
     return chunks
 
 
-# ------------------------ STEP 2: BUILDING THE STORE ------------------------
-def add_overlap(chunks, n=150):
-    return [chunks[0]] + [chunks[i-1][-n:] + "\n" + chunks[i] for i in range(1, len(chunks))] if chunks else chunks
+def add_overlap(chunks, overlap=CHUNK_OVERLAP):
+    """Carry a short tail from each chunk into the next chunk for context continuity."""
+    if not chunks:
+        return []
+    result = [chunks[0]]
+    for index in range(1, len(chunks)):
+        prefix = chunks[index - 1][-overlap:] if overlap else ""
+        result.append(f"{prefix}\n{chunks[index]}" if prefix else chunks[index])
+    return result
+
+
+def gemini_embed(texts, task_type="RETRIEVAL_DOCUMENT"):
+    """Generate embeddings in batches using Gemini's embedding endpoint."""
+    if not texts:
+        return []
+
+    results = []
+    for start in range(0, len(texts), 50):
+        batch = texts[start:start + 50]
+        payload = {
+            "requests": [
+                {
+                    "model": f"models/{EMBED_MODEL}",
+                    "content": {"parts": [{"text": text}]},
+                    "taskType": task_type,
+                }
+                for text in batch
+            ]
+        }
+        response = requests.post(
+            f"{GEMINI_URL}/models/{EMBED_MODEL}:batchEmbedContents",
+            headers=api_headers(),
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        results.extend(
+            np.asarray(item["values"], dtype=float)
+            for item in response.json()["embeddings"]
+        )
+    return results
+
+
+def gemini_generate(prompt):
+    """Try supported Flash models in order, falling back when busy/unavailable."""
+    unavailable_statuses = {404, 429, 503}
+    last_response = None
+
+    for attempt in range(2):
+        for model in LLM_MODELS:
+            response = requests.post(
+                f"{GEMINI_URL}/models/{model}:generateContent",
+                headers=api_headers(),
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code in unavailable_statuses:
+                print(f"  {model} unavailable ({response.status_code}); trying the next model...")
+                last_response = response
+                continue
+            response.raise_for_status()
+            data = response.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise RuntimeError("Gemini returned no answer. Try rephrasing your question.")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            answer_text = "\n".join(part.get("text", "") for part in parts).strip()
+            if not answer_text:
+                raise RuntimeError("Gemini returned an empty answer. Please try again.")
+            return answer_text
+        if attempt == 0:
+            time.sleep(3)
+
+    if last_response is not None:
+        last_response.raise_for_status()
+    raise RuntimeError("All configured Gemini models are busy or unavailable. Try again later.")
+
 
 def ingest():
-    """Read every note in docs/, chunk it, embed it, save to vector_store.json."""
-    if not DOCS_DIR.exists():
-        DOCS_DIR.mkdir()
-        print(f"Created the '{DOCS_DIR}' folder — now drop your .txt notes in it and run me again!")
-        return False
-
-    files = [p for p in DOCS_DIR.iterdir() if p.suffix.lower() in (".txt", ".md")]
+    """Read notes, create chunks and embeddings, then save a local vector store."""
+    files = get_note_files()
     if not files:
-        print(f"No .txt or .md files found in '{DOCS_DIR}/'. Add some notes and run again.")
+        DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"No .txt or .md files found in '{DOCS_DIR}'. Add notes and try again.")
         return False
 
-    all_chunks, all_sources = [], []
+    all_chunks = []
+    all_sources = []
     for path in files:
         print(f"  Reading {path.name} ...")
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            print(f"  Skipping empty file: {path.name}")
+            continue
         for chunk in add_overlap(chunk_text(text)):
             all_chunks.append(chunk)
             all_sources.append(path.name)
 
-    print(f"  Made {len(all_chunks)} chunks. Embedding them (a few seconds)...")
-    # Gemini accepts up to 100 texts per embedding request, so send in batches
-    embeddings = []
-    for i in range(0, len(all_chunks), 50):
-        batch = all_chunks[i : i + 50]
-        print(f"  ... embedding batch {i // 50 + 1} ({len(batch)} chunks)")
-        embeddings.extend(gemini_embed(batch))
+    if not all_chunks:
+        print("The note files were empty; nothing was indexed.")
+        return False
 
+    print(f"  Created {len(all_chunks)} chunks. Generating embeddings...")
+    embeddings = gemini_embed(all_chunks, task_type="RETRIEVAL_DOCUMENT")
     store = {
         "chunks": all_chunks,
         "sources": all_sources,
-        "embeddings": [e.tolist() for e in embeddings],
+        "embeddings": [embedding.tolist() for embedding in embeddings],
+        "embedding_model": EMBED_MODEL,
     }
-    STORE_FILE.write_text(json.dumps(store))
-    print(f"  Saved to {STORE_FILE}. Your notes are now searchable! 🎉")
+    STORE_FILE.write_text(json.dumps(store), encoding="utf-8")
+    print(f"  Saved the local index to {STORE_FILE.name}.")
     return True
 
 
 def load_store():
-    """Load the saved chunks + embeddings from disk into memory."""
-    store = json.loads(STORE_FILE.read_text())
-    matrix = np.array(store["embeddings"])                 # shape: (n_chunks, dim)
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)  # length of each row
-    matrix = matrix / np.clip(norms, 1e-10, None)         # normalize -> cosine similarity
+    """Load the local index and normalize its vectors for cosine similarity."""
+    store = json.loads(STORE_FILE.read_text(encoding="utf-8"))
+    required_keys = {"chunks", "sources", "embeddings"}
+    if not required_keys.issubset(store):
+        raise ValueError("The vector store is missing required fields. Run 'rebuild'.")
+    if not store["chunks"] or not store["embeddings"]:
+        raise ValueError("The vector store is empty. Run 'rebuild' after adding notes.")
+    if not (len(store["chunks"]) == len(store["sources"]) == len(store["embeddings"])):
+        raise ValueError("The vector store has mismatched data. Run 'rebuild'.")
+
+    matrix = np.asarray(store["embeddings"], dtype=float)
+    if matrix.ndim != 2:
+        raise ValueError("The stored embeddings are invalid. Run 'rebuild'.")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    matrix = matrix / np.clip(norms, 1e-10, None)
     return store["chunks"], store["sources"], matrix
 
 
-# ------------------------ STEP 3: RETRIEVAL (search) ------------------------
-
-
 def retrieve(question, chunks, matrix, k=TOP_K):
-    """Find the k chunks whose meaning is closest to the question."""
-    question_vec = gemini_embed([question])[0]
-    question_vec = question_vec / np.linalg.norm(question_vec)  # normalize too
-    scores = matrix @ question_vec  # cosine similarity vs every chunk
-    best = np.argsort(scores)[::-1][:k]  # top-k indexes, highest score first
-    return best
-
-
-# ------------------------- STEP 4: THE FULL PIPELINE -------------------------
+    """Return the indices of chunks most semantically similar to a question."""
+    question_vector = gemini_embed([question], task_type="RETRIEVAL_QUERY")[0]
+    norm = np.linalg.norm(question_vector)
+    if norm == 0:
+        raise RuntimeError("Gemini returned an empty question embedding.")
+    question_vector = question_vector / norm
+    if matrix.shape[1] != question_vector.shape[0]:
+        raise ValueError(
+            "The saved vectors use a different embedding size. Delete vector_store.json and rebuild."
+        )
+    scores = matrix @ question_vector
+    return np.argsort(scores)[::-1][:min(k, len(chunks))]
 
 
 def answer(question, chunks, sources, matrix):
-    """Retrieve relevant chunks, then ask the LLM to answer using them."""
-    best = retrieve(question, chunks, matrix)
+    """Retrieve relevant chunks and ask Gemini to answer from those sources."""
+    best_indices = retrieve(question, chunks, matrix)
     context = "\n\n---\n\n".join(
-        f"[Source: {sources[i]}]\n{chunks[i]}" for i in best
+        f"[Source: {sources[index]}]\n{chunks[index]}" for index in best_indices
     )
     prompt = (
-        "You are a helpful study assistant. Answer the student's question "
-        "using ONLY the context below. Mention which source you used. "
-        "If the context doesn't contain the answer, say you don't know.\n\n"
-        f"CONTEXT:\n{context}\n\n"
-        f"QUESTION: {question}\n\n"
-        "ANSWER:"
+        "You are a careful study assistant. Answer using only the context below. "
+        "Cite the source filename in your answer. If the context does not contain "
+        "the answer, say that the notes do not provide enough information.\n\n"
+        f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"
     )
     reply = gemini_generate(prompt)
-    cited = sorted({sources[i] for i in best})
-    return reply, cited, best
+    cited_sources = sorted({sources[index] for index in best_indices})
+    return reply, cited_sources, best_indices
 
 
-# --------------------------------- MAIN ---------------------------------
+def print_rag_help():
+    print(
+        "\nCommands:\n"
+        "  :help             Show commands\n"
+        "  :notes            List indexed note files\n"
+        "  :stats            Show index statistics\n"
+        "  :find <text>      Search note text locally without using Gemini\n"
+        "  rebuild           Rebuild embeddings from docs/ (uses Gemini)\n"
+        "  exit              Quit\n"
+        "\nFor fully local keyword searching without an API key, run: python app.py --local\n"
+    )
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("  NOTEMIND AI  --  your notes + Google Gemini  🚀")
-    print("=" * 60)
-    check_api_key()
+def show_index_notes(sources):
+    counts = {}
+    for source in sources:
+        counts[source] = counts.get(source, 0) + 1
+    if not counts:
+        print("No indexed notes found.")
+        return
+    print("\nIndexed note files:")
+    for name in sorted(counts, key=str.casefold):
+        print(f"  {name} — {counts[name]} chunk(s)")
+    print()
 
-    # First run ever? Build the store. Deleted or changed your notes?
-    # Delete vector_store.json and run again (or type 'rebuild').
+
+def show_index_stats(chunks, sources, matrix):
+    unique_sources = len(set(sources))
+    embedding_dimensions = matrix.shape[1] if matrix.ndim == 2 else 0
+    store_size = STORE_FILE.stat().st_size if STORE_FILE.exists() else 0
+    print("\nNoteMind AI index statistics")
+    print(f"  Note files: {unique_sources}")
+    print(f"  Chunks: {len(chunks)}")
+    print(f"  Embedding dimensions: {embedding_dimensions}")
+    print(f"  Local index size: {store_size:,} bytes\n")
+
+
+def run_rag_mode():
+    print("=" * 58)
+    print("  NOTEMIND AI — your notes + Gemini")
+    print("=" * 58)
+    if not API_KEY:
+        raise SystemExit(
+            "Gemini API key not found. Set GEMINI_API_KEY or configure secret.py.\n"
+            "For local keyword search without a key, run: python app.py --local\n"
+        )
+
     if not STORE_FILE.exists():
+        print("No index found yet; creating one from docs/...")
         if not ingest():
             raise SystemExit(1)
 
-    chunks, sources, matrix = load_store()
-    print(f"\nLoaded {len(chunks)} chunks. Ask me anything about your notes!")
-    print("(Type 'exit' to quit, 'rebuild' to re-read the docs folder)\n")
+    try:
+        chunks, sources, matrix = load_store()
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(f"Could not load {STORE_FILE.name}: {exc}\nRun 'python app.py' after deleting the index, or rebuild it.")
+
+    print(f"Loaded {len(chunks)} chunks from {len(set(sources))} note file(s).")
+    print_rag_help()
 
     while True:
-        question = input("You > ").strip()
+        try:
+            question = input("You > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye.")
+            break
         if not question:
             continue
-        if question.lower() in ("exit", "quit"):
-            print("Bye! Come back with more notes 📚")
+
+        if question.casefold() in {"exit", "quit"}:
+            print("Goodbye. Keep learning!")
             break
-        if question.lower() == "rebuild":
+        if question.casefold() in {":help", "/help", "help"}:
+            print_rag_help()
+            continue
+        if question.casefold() in {":notes", "/notes", "notes"}:
+            show_index_notes(sources)
+            continue
+        if question.casefold() in {":stats", "/stats", "stats"}:
+            show_index_stats(chunks, sources, matrix)
+            continue
+        if question.casefold().startswith((":find ", "/find ", "find ")):
+            _, _, search_text = question.partition(" ")
+            if search_text.startswith(":") or search_text.startswith("/"):
+                _, _, search_text = search_text.partition(" ")
+            matches = find_local_matches(search_text)
+            if not matches:
+                print(f"No local matches for {search_text!r}.\n")
+            else:
+                print("\nLocal matches (no Gemini request made):")
+                for item in matches:
+                    print(f"  {item['source']}:{item['line']} — {item['text']}")
+                print()
+            continue
+        if question.casefold() == "rebuild":
+            print("Rebuilding the index from docs/...")
             if ingest():
                 chunks, sources, matrix = load_store()
+                print(f"Index rebuilt: {len(chunks)} chunks from {len(set(sources))} note file(s).")
             continue
+
         try:
             reply, cited, best = answer(question, chunks, sources, matrix)
             print(f"\nAI > {reply}")
-            for i in best:
-                print(f"   📄 {sources[i]}: {chunks[i][:100].replace("\n", " ").strip()}...")
+            print("Sources used:")
+            for source in cited:
+                print(f"  • {source}")
+            print("Retrieved excerpts:")
+            for index in best:
+                snippet = " ".join(chunks[index].split())[:160]
+                print(f"  • {sources[index]}: {snippet}{'…' if len(chunks[index]) > 160 else ''}")
             print()
-        except requests.exceptions.HTTPError as err:
-            print(f"\n⚠️  Gemini returned an error: {err.response.status_code if err.response is not None else 'busy'}. "
-                  "Double-check your API key (in SETTINGS) and your internet.\n")
-        except requests.exceptions.ConnectionError:
-            print("\n⚠️  Can't reach the internet! Check your connection and retry.\n")
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            body = exc.response.text[:500] if exc.response is not None else str(exc)
+            print(f"\nGemini API error ({status}): {body}\n")
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            print("\nCould not reach Gemini. Check your internet connection and try again.\n")
+        except (RuntimeError, ValueError, KeyError) as exc:
+            print(f"\nCould not answer that question: {exc}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Ask questions about your notes with NoteMind AI.")
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="use local keyword search only (no API key or internet required)",
+    )
+    args = parser.parse_args()
+    if args.local:
+        run_local_mode()
+    else:
+        run_rag_mode()
+
+
+if __name__ == "__main__":
+    main()
